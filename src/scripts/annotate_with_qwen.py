@@ -55,7 +55,8 @@ def create_dataset(dataset_path: str, rag_dataset: str):
                             You are given a question that adresses a paper named {paper_name}.\n\n
                             Here is the question you need to rephrase: {question} \n\n
                             Here is the paper's summary you are working with, try to make question specific {paper_context}\n\n
-                            Return just a question no need to specify the reasoning behind the question you decided to make.
+                            Return just a question no need to specify the reasoning behind the question you decided to make. It should be possible to understand which paper is question about without reading the paper. 
+                            Don't write "context of this paper" specify which paper.
                           """
                 messages = tokenizer.apply_chat_template([
                             {"role": "system", "content": "You are a helpful assistant that makes question about scientific papers more specific, your task is to rephrase the question to make it adress the paper name and make it specific so it would be obvious about which paper is the quiestion. it should be possible to understand the source for the question SPECIFY THE PAPER NAME AND ADRESS IT TO MAKE QUESTION SPECIFIC"},
