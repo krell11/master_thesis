@@ -1,6 +1,7 @@
 import json
-from transformers import AutoTokenizer
+import re
 
+from transformers import AutoTokenizer
 
 SYSTEM_POLICY_PROMPT = """
                             You answer scientific paper questions using ONLY the provided context.
@@ -19,11 +20,60 @@ SYSTEM_POLICY_PROMPT = """
 
 def build_policy_prompt(question: str, paper_name: str, context: str, tokenizer: AutoTokenizer) -> str:
     messages = [
-        {"role": "system" , "content": SYSTEM_POLICY_PROMPT},
-        {"role": "user", "content": f"Paper: {paper_name}\n\nQuestion: {question}\n\nContext:\n{context}"}
+        {"role": "system", "content": SYSTEM_POLICY_PROMPT.strip()},
+        {
+            "role": "user",
+            "content": (
+                f"Paper: {paper_name}\n\n"
+                f"Question: {question}\n\n"
+                f"Context:\n{context}"
+            ),
+        },
     ]
-    return tokenizer.apply_chat_template(messages, tokenizer=False, add_generational_prompt=True, enable_thinking=False)
+    prompt = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if not isinstance(prompt, str):
+        raise TypeError(
+            f"apply_chat_template must return str, got {type(prompt)}. "
+            "Check tokenize=False / add_generation_prompt spelling."
+        )
+    return prompt
 
 
-def parse_policy_output(raw_text: str):
-    return json.dumps(raw_text, ensure_ascii=False)
+def parse_policy_output(raw_text: str) -> dict:
+    text = raw_text.strip()
+    if "</think>" in text:
+        text = text.split("</think>")[-1].strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+    data = json.loads(text)
+    if "y" not in data:
+        raise ValueError(f"Policy JSON missing 'y': {data!r}")
+
+    raw_claims = data.get("claims", [])
+    claims = []
+    for i, c in enumerate(raw_claims):
+        if isinstance(c, str):
+            claims.append({"claim_id": f"c{i}", "text": c.strip()})
+        elif isinstance(c, dict):
+            text_c = c.get("text") or c.get("claim") or c.get("content")
+            if not text_c:
+                raise ValueError(f"Claim dict missing text: {c!r}")
+            claims.append(
+                {
+                    "claim_id": str(c.get("claim_id") or c.get("id") or f"c{i}"),
+                    "text": str(text_c).strip(),
+                }
+            )
+        else:
+            raise TypeError(f"Unexpected claim type: {type(c)} {c!r}")
+    if not claims:
+        # fallback: treat whole answer as one claim
+        claims = [{"claim_id": "c0", "text": str(data["y"]).strip()}]
+    data["claims"] = claims[:3]
+    return data
+
