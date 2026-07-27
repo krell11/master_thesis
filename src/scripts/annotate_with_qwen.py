@@ -61,9 +61,11 @@ def is_paper_specific(question: str, paper_name: str) -> bool:
 def force_paper_specific(question: str, paper_name: str) -> str:
     short = paper_short_name(paper_name)
     q = question.strip()
+    # Use a callable repl — paper titles may contain backslashes (e.g. \d)
+    # which break re.sub when passed as a replacement template string.
     q = re.sub(
         r"\b(this work|this paper|this model|the authors|their method|the proposed)\b",
-        short,
+        lambda _m: short,
         q,
         flags=re.IGNORECASE,
     )
