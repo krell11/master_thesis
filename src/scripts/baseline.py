@@ -24,14 +24,14 @@ TOP_K = 5
 
 
 def main(
-    train_path,
+    generated_path,
     rag_path,
     outputs_path,
     max_examples: int | None = None,
     top_k: int = TOP_K,
 ):
     rag_dataset = load_jsonl(rag_path)
-    train_dataset = load_jsonl(train_path)
+    generated = load_jsonl(generated_path)
 
     print(f"Building BM25 index over {len(rag_dataset)} papers...")
     retriever = CorpusRetriever(rag_dataset)
@@ -54,34 +54,44 @@ def main(
     )
 
     examples = []
-    for train_row, rag_row in zip(train_dataset, rag_dataset):
-        assert train_row["id"] == rag_row["id"], (
-            f"train/rag id mismatch: {train_row['id']} vs {rag_row.get('id')}"
+    for row in generated:
+        paper_id = row["id"]
+        paper_name = row.get("title") or row.get("paper_name") or ""
+        # Prefer rewritten paper-specific query for retrieval + answering
+        question = (row.get("qas") or row.get("question") or "").strip()
+        question_original = (row.get("question") or question).strip()
+        if not question:
+            continue
+
+        retrieved = retriever.retrieve(question, top_k=top_k)
+        context = format_retrieved_context(retrieved, max_chars=MAX_CONTEXT_CHARS)
+        hit = any(h["paper_id"] == paper_id for h in retrieved)
+        examples.append(
+            {
+                "id": paper_id,
+                "paper_name": paper_name,
+                "question": question,
+                "question_original": question_original,
+                "retrieved": retrieved,
+                "context": context,
+                "retrieval_hit": hit,
+            }
         )
-        paper_name = rag_row.get("paper_name") or train_row["title"]
-        for q in train_row["qas"]["question"]:
-            question = q.strip()
-            retrieved = retriever.retrieve(question, top_k=top_k)
-            context = format_retrieved_context(retrieved, max_chars=MAX_CONTEXT_CHARS)
-            examples.append(
-                {
-                    "id": train_row["id"],
-                    "paper_name": paper_name,
-                    "question": question,
-                    "retrieved": retrieved,
-                    "context": context,
-                }
-            )
-            if max_examples is not None and len(examples) >= max_examples:
-                break
         if max_examples is not None and len(examples) >= max_examples:
             break
 
+    hits = sum(1 for e in examples if e["retrieval_hit"])
+    print(
+        f"Retrieval Hit@{top_k}: {hits}/{len(examples)} "
+        f"({100.0 * hits / max(len(examples), 1):.1f}%)"
+    )
     print(f"Running Policy on {len(examples)} examples (no anti-queries)...")
+    print("Sample q0:", examples[0]["question"][:120])
     print("Sample retrieval for q0:")
     for hit in examples[0]["retrieved"][:3]:
+        mark = "*" if hit["paper_id"] == examples[0]["id"] else " "
         print(
-            f"  [{hit['rank']}] score={hit['score']:.2f} "
+            f" {mark}[{hit['rank']}] score={hit['score']:.2f} "
             f"{hit['paper_name'][:50]} | {hit['section'][:40]}"
         )
 
@@ -109,7 +119,9 @@ def main(
             {
                 "id": e["id"],
                 "paper_name": e["paper_name"],
+                "question_original": e["question_original"],
                 "question": e["question"],
+                "retrieval_hit": e["retrieval_hit"],
                 "retrieved": [
                     {
                         "paper_id": h["paper_id"],
@@ -133,7 +145,7 @@ def main(
 
 if __name__ == "__main__":
     main(
-        train_path=str(ROOT / "data" / "train_data" / "train.jsonl"),
+        generated_path=str(ROOT / "data" / "train_data" / "generated.jsonl"),
         rag_path=str(ROOT / "data" / "train_data" / "rag.jsonl"),
         outputs_path=str(ROOT / "data" / "train_data" / "rollouts_rag_smoke.jsonl"),
         max_examples=3,

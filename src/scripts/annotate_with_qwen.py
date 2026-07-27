@@ -27,12 +27,68 @@ GENERIC_PHRASES = (
     "the proposed",
 )
 
+STOPWORDS = {
+    "how",
+    "what",
+    "when",
+    "where",
+    "why",
+    "which",
+    "who",
+    "whom",
+    "whose",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "the",
+    "a",
+    "an",
+    "of",
+    "in",
+    "on",
+    "at",
+    "to",
+    "for",
+    "and",
+    "or",
+    "by",
+    "with",
+    "from",
+    "as",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "would",
+    "should",
+    "will",
+    "this",
+    "that",
+    "these",
+    "those",
+    "their",
+    "they",
+    "them",
+    "its",
+    "it",
+    "used",
+    "using",
+    "use",
+}
+
 SYSTEM_PROMPT = """
-You rewrite questions into paper-specific search queries.
-Output ONLY one question.
-MUST include the exact paper title (or its distinctive short name from the title).
-Also include a key method/dataset from context when relevant.
-FORBIDDEN: this paper, this work, the authors, they, the model (without a name).
+You rewrite ONE question into a paper-specific search query.
+Rules:
+1. Keep the SAME meaning and key terms as the Original question.
+2. MUST include the exact paper title (or Paper short name).
+3. Replace vague refs (this paper / this work / the authors / the model) with the paper/method name.
+4. Output ONLY the rewritten question. No explanations.
+FORBIDDEN: inventing a different topic; copying unrelated example questions.
 """.strip()
 
 
@@ -49,6 +105,18 @@ def paper_anchors(paper_name: str) -> list[str]:
     return list(anchors)
 
 
+def content_tokens(text: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return {t for t in tokens if len(t) > 2 and t not in STOPWORDS}
+
+
+def preserves_meaning(original: str, rewritten: str, min_recall: float = 0.4) -> bool:
+    orig = content_tokens(original)
+    if not orig:
+        return True
+    return len(orig & content_tokens(rewritten)) / len(orig) >= min_recall
+
+
 def is_paper_specific(question: str, paper_name: str) -> bool:
     q = question.lower().strip()
     if len(q) < 12 or "?" not in q:
@@ -61,8 +129,7 @@ def is_paper_specific(question: str, paper_name: str) -> bool:
 def force_paper_specific(question: str, paper_name: str) -> str:
     short = paper_short_name(paper_name)
     q = question.strip()
-    # Use a callable repl — paper titles may contain backslashes (e.g. \d)
-    # which break re.sub when passed as a replacement template string.
+    # Callable repl — titles may contain backslashes that break template strings.
     q = re.sub(
         r"\b(this work|this paper|this model|the authors|their method|the proposed)\b",
         lambda _m: short,
@@ -94,21 +161,17 @@ def build_annotate_prompt(paper_name: str, question: str, context: str) -> str:
     short = paper_short_name(paper_name)
     context_block = context if context else "(No extra paper text available.)"
     user = f"""Paper title: {paper_name}
-Paper short name: {short}
+                Paper short name: {short}
 
-Paper context:
-{context_block}
+                Paper context (optional hints only; do NOT change the question topic):
+                {context_block}
 
-Original question: {question.strip()}
+                Original question: {question.strip()}
 
-Rewrite so a search engine can find THIS paper.
+                Rewrite the Original question so it names this paper.
+                Keep the original topic and key terms. Only disambiguate the paper.
 
-Bad: How is intent annotated?
-Bad: How big is the AntiScam dataset?
-Good: How is intent annotated in "End-to-End Trainable Non-Collaborative Dialog System" (MISSA)?
-Good: How large is the AntiScam dataset in "End-to-End Trainable Non-Collaborative Dialog System"?
-
-Output only the rewritten question."""
+                Output only the rewritten question."""
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user},
@@ -122,6 +185,25 @@ Output only the rewritten question."""
     if not isinstance(prompt, str):
         raise TypeError(f"apply_chat_template must return str, got {type(prompt)}")
     return prompt
+
+
+def finalize_rewrite(
+    rewritten: str,
+    original: str,
+    paper_name: str,
+    seen_for_paper: set[str],
+) -> str:
+    q = (rewritten or "").strip()
+    bad = (
+        not q
+        or not is_paper_specific(q, paper_name)
+        or not preserves_meaning(original, q)
+        or q.lower() in seen_for_paper
+    )
+    if bad:
+        q = force_paper_specific(original, paper_name)
+    # If template still collides (rare), keep it — original questions are unique.
+    return q
 
 
 def load_rag(rag_path: str) -> list[dict]:
@@ -176,7 +258,7 @@ def process_dataset(
 
     sampling_params = SamplingParams(
         n=1,
-        top_p=0.9,
+        top_p=1.0,
         temperature=0.3,
         seed=999,
         max_tokens=128,
@@ -191,13 +273,19 @@ def process_dataset(
     )
     outputs = llm.generate(prompts, sampling_params)
 
+    seen: dict[str, set[str]] = {}
+    n_fallback = 0
     with open(outputs_path, "w", encoding="utf-8") as f:
         for record, output in zip(meta, outputs):
-            rewritten = clean_generation(output.outputs[0].text)
-            if not is_paper_specific(rewritten, record["title"]):
-                rewritten = force_paper_specific(
-                    rewritten or record["question"], record["title"]
-                )
+            paper_id = record["id"]
+            seen.setdefault(paper_id, set())
+            raw = clean_generation(output.outputs[0].text)
+            rewritten = finalize_rewrite(
+                raw, record["question"], record["title"], seen[paper_id]
+            )
+            if rewritten != raw:
+                n_fallback += 1
+            seen[paper_id].add(rewritten.lower())
             f.write(
                 json.dumps(
                     {
@@ -210,6 +298,8 @@ def process_dataset(
                 )
                 + "\n"
             )
+    print(f"Wrote {len(meta)} rewrites -> {outputs_path}")
+    print(f"Fallbacks to template: {n_fallback}/{len(meta)}")
 
 
 if __name__ == "__main__":
@@ -217,6 +307,7 @@ if __name__ == "__main__":
         str(ROOT / "data" / "train_data" / "train.jsonl"),
         str(ROOT / "data" / "train_data" / "rag.jsonl"),
     )
+    print(f"Annotating {len(prompts)} questions...")
     process_dataset(
         prompts,
         meta,
