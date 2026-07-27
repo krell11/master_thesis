@@ -4,29 +4,37 @@ import re
 from transformers import AutoTokenizer
 
 SYSTEM_POLICY_PROMPT = """
-                            You answer scientific paper questions using ONLY the provided context.
-                            Then split your answer into atomic factual claims.
-                            Rules:
-                            - Answer the question; do not refuse if context is partial — say what the context supports
-                            - Each claim must be a single checkable statement entailed by your answer y
-                            - Do not invent facts absent from the context
-                            - Prefer concrete names (paper method, dataset, numbers) over "this paper" / "the authors"
-                            - Output ONLY valid JSON, no markdown, no extra text
-                            JSON schema:
-                            {"y": "<final answer string>", "claims": [{"claim_id": "c0", "text": "<atomic claim>"}, ...]}
-                            Use 1–5 claims. claim_id = c0, c1, ...
+You answer scientific paper questions using ONLY the retrieved context passages.
+Then split your answer into atomic factual claims.
+
+Rules:
+- Use only facts supported by the retrieved passages
+- If evidence is missing or conflicting, say what the passages support
+- Prefer concrete names (paper/method/dataset/numbers) over "this paper" / "the authors"
+- Each claim must be a single checkable statement entailed by your answer y
+- Output ONLY valid JSON, no markdown, no extra text
+
+JSON schema:
+{"y": "<final answer string>", "claims": [{"claim_id": "c0", "text": "<atomic claim>"}, ...]}
+Use 1–5 claims. claim_id = c0, c1, ...
 """
 
 
-def build_policy_prompt(question: str, paper_name: str, context: str, tokenizer: AutoTokenizer) -> str:
+def build_policy_prompt(
+    question: str,
+    context: str,
+    tokenizer: AutoTokenizer,
+    paper_name: str | None = None,
+) -> str:
+    header = f"Target paper (optional hint): {paper_name}\n\n" if paper_name else ""
     messages = [
         {"role": "system", "content": SYSTEM_POLICY_PROMPT.strip()},
         {
             "role": "user",
             "content": (
-                f"Paper: {paper_name}\n\n"
+                f"{header}"
                 f"Question: {question}\n\n"
-                f"Context:\n{context}"
+                f"Retrieved context:\n{context}"
             ),
         },
     ]
@@ -44,13 +52,45 @@ def build_policy_prompt(question: str, paper_name: str, context: str, tokenizer:
     return prompt
 
 
+def _fix_invalid_json_escapes(s: str) -> str:
+    """Escape backslashes that are not valid JSON escape sequences (e.g. LaTeX \\mathcal)."""
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            nxt = s[i + 1]
+            if nxt in '"\\/bfnrt':
+                out.append(s[i : i + 2])
+                i += 2
+                continue
+            if (
+                nxt == "u"
+                and i + 5 < len(s)
+                and all(c in "0123456789abcdefABCDEF" for c in s[i + 2 : i + 6])
+            ):
+                out.append(s[i : i + 6])
+                i += 6
+                continue
+            out.append("\\\\")
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def parse_policy_output(raw_text: str) -> dict:
     text = raw_text.strip()
     if "</think>" in text:
         text = text.split("</think>")[-1].strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = json.loads(_fix_invalid_json_escapes(text))
     if "y" not in data:
         raise ValueError(f"Policy JSON missing 'y': {data!r}")
 
@@ -72,8 +112,6 @@ def parse_policy_output(raw_text: str) -> dict:
         else:
             raise TypeError(f"Unexpected claim type: {type(c)} {c!r}")
     if not claims:
-        # fallback: treat whole answer as one claim
         claims = [{"claim_id": "c0", "text": str(data["y"]).strip()}]
     data["claims"] = claims[:3]
     return data
-
