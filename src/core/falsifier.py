@@ -22,11 +22,23 @@ JSON schema example for 2 claims:
 """
 
 
-def build_falsifier_prompt(paper_name, claims, tokenizer: AutoTokenizer) -> str:
+def build_falsifier_prompt(
+    paper_name,
+    claims,
+    tokenizer: AutoTokenizer,
+    question: str | None = None,
+    answer: str | None = None,
+) -> str:
     claims = claims[:3]
     claims_block = "\n".join(f"- {c['claim_id']}: {c['text']}" for c in claims)
+    context_bits = [f"Paper: {paper_name}"]
+    if question:
+        context_bits.append(f"Question: {question.strip()}")
+    if answer:
+        context_bits.append(f"Answer y: {answer.strip()}")
     user = (
-        f"Paper: {paper_name}\n\n"
+        "\n".join(context_bits)
+        + "\n\n"
         f"Claims ({len(claims)} total — emit exactly these claim_ids once):\n"
         f"{claims_block}\n\n"
         "Write anti_queries for each claim as one JSON object, then stop."
