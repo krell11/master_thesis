@@ -1,10 +1,6 @@
 """Full falsification pipeline (offline):
-  x → RAG(E+) → Policy(y, claims)
-    → Falsifier(anti-queries)
-    → RAG(E−)
-    → Adjudicator(verdicts)
-    → asymmetric reward r
-    → audit JSONL
+
+  x → RAG(E+) → Policy(y, claims) → score_policy_response (Falsifier → RAG(E−) → Adjudicator → r) → audit JSONL
 """
 
 from __future__ import annotations
@@ -22,10 +18,8 @@ if str(ROOT) not in sys.path:
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-from src.core.adjudicator import build_adjudicator_prompt, parse_adjudicator_output
-from src.core.falsifier import build_falsifier_prompt, parse_falsifier_output
-from src.core.policy import build_policy_prompt, parse_policy_output
-from src.core.reward import compute_reward
+from src.core.falsification_score import score_policy_response
+from src.core.policy import build_policy_prompt
 from src.core.retriever import CorpusRetriever, format_retrieved_context
 from src.utils import load_jsonl, save_jsonl
 
@@ -35,67 +29,6 @@ tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 MAX_CONTEXT_CHARS = 6000
 TOP_K_POS = 5
 TOP_K_NEG = 3
-ANTI_QUERIES_PER_CLAIM = 2
-
-
-def _align_falsifier_claims(policy_claims: list[dict], falsifier_out: dict) -> list[dict]:
-    """Match anti_queries back onto policy claims by claim_id (fallback: order)."""
-    by_id = {}
-    for c in falsifier_out.get("claims") or []:
-        cid = str(c.get("claim_id", ""))
-        aqs = [q.strip() for q in (c.get("anti_queries") or []) if str(q).strip()]
-        by_id[cid] = aqs[:ANTI_QUERIES_PER_CLAIM]
-
-    aligned = []
-    for i, pc in enumerate(policy_claims):
-        cid = str(pc.get("claim_id", f"c{i}"))
-        aqs = by_id.get(cid)
-        if aqs is None:
-            # fallback by index
-            raw = (falsifier_out.get("claims") or [])
-            aqs = []
-            if i < len(raw):
-                aqs = [
-                    q.strip()
-                    for q in (raw[i].get("anti_queries") or [])
-                    if str(q).strip()
-                ][:ANTI_QUERIES_PER_CLAIM]
-        if not aqs:
-            # last resort: searchable negation from claim text
-            aqs = [f"evidence against: {pc['text'][:120]}"]
-        aligned.append(
-            {
-                "claim_id": cid,
-                "text": pc["text"],
-                "anti_queries": aqs,
-            }
-        )
-    return aligned
-
-
-def retrieve_counter_evidence(
-    retriever: CorpusRetriever,
-    anti_queries: list[str],
-    *,
-    top_k: int = TOP_K_NEG,
-    exclude_paper_id: str | None = None,
-) -> list[dict]:
-    seen: set[str] = set()
-    hits: list[dict] = []
-    for q in anti_queries:
-        for h in retriever.retrieve(q, top_k=top_k + 3):
-            if exclude_paper_id and h["paper_id"] == exclude_paper_id:
-                continue
-            cid = h["chunk_id"]
-            if cid in seen:
-                continue
-            seen.add(cid)
-            item = dict(h)
-            item["anti_query"] = q
-            hits.append(item)
-            if len(hits) >= top_k * max(len(anti_queries), 1):
-                return hits
-    return hits
 
 
 def main(
@@ -133,6 +66,16 @@ def main(
         trust_remote_code=True,
     )
 
+    def make_generate(params: SamplingParams):
+        def _generate(prompts: list[str]) -> list[str]:
+            outs = llm.generate(prompts, params)
+            return [o.outputs[0].text for o in outs]
+
+        return _generate
+
+    falsifier_generate = make_generate(falsifier_params)
+    adjudicator_generate = make_generate(adjudicator_params)
+
     examples = []
     for row in generated:
         paper_id = row["id"]
@@ -143,7 +86,9 @@ def main(
             continue
 
         retrieved_pos = retriever.retrieve(question, top_k=top_k_pos)
-        context = format_retrieved_context(retrieved_pos, max_chars=MAX_CONTEXT_CHARS)
+        context = format_retrieved_context(
+            retrieved_pos, max_chars=MAX_CONTEXT_CHARS
+        )
         examples.append(
             {
                 "id": paper_id,
@@ -152,7 +97,9 @@ def main(
                 "question_original": question_original,
                 "retrieved_pos": retrieved_pos,
                 "context": context,
-                "retrieval_hit": any(h["paper_id"] == paper_id for h in retrieved_pos),
+                "retrieval_hit": any(
+                    h["paper_id"] == paper_id for h in retrieved_pos
+                ),
             }
         )
         if max_examples is not None and len(examples) >= max_examples:
@@ -164,7 +111,6 @@ def main(
         f"({100.0 * hits / max(len(examples), 1):.1f}%)"
     )
 
-    # ---- Stage 1: Policy ----
     print(f"Stage 1 Policy on {len(examples)} examples...")
     policy_prompts = [
         build_policy_prompt(
@@ -173,121 +119,23 @@ def main(
         for e in examples
     ]
     policy_raw = llm.generate(policy_prompts, policy_params)
-    policy_outs = []
-    for i, o in enumerate(policy_raw):
-        try:
-            policy_outs.append(parse_policy_output(o.outputs[0].text))
-        except Exception as exc:
-            raise RuntimeError(
-                f"Policy parse failed for example {i}: {o.outputs[0].text!r}"
-            ) from exc
 
-    # ---- Stage 2: Falsifier ----
-    print("Stage 2 Falsifier...")
-    falsifier_prompts = [
-        build_falsifier_prompt(
-            e["paper_name"],
-            p["claims"],
-            tokenizer,
-            question=e["question"],
-            answer=p["y"],
-        )
-        for e, p in zip(examples, policy_outs)
-    ]
-    falsifier_raw = llm.generate(falsifier_prompts, falsifier_params)
-    falsifier_claims = []
-    for i, (p, o) in enumerate(zip(policy_outs, falsifier_raw)):
-        try:
-            fout = parse_falsifier_output(o.outputs[0].text)
-        except Exception:
-            fout = {"claims": []}
-        falsifier_claims.append(_align_falsifier_claims(p["claims"], fout))
-
-    # ---- Stage 3: RAG(E−) ----
-    print("Stage 3 RAG counter-evidence...")
-    claim_evidence: list[list[dict]] = []
-    for e, claims in zip(examples, falsifier_claims):
-        per_claim = []
-        exclude = e["id"] if exclude_source_paper else None
-        for c in claims:
-            hits_neg = retrieve_counter_evidence(
-                retriever,
-                c["anti_queries"],
-                top_k=top_k_neg,
-                exclude_paper_id=exclude,
-            )
-            per_claim.append(
-                {
-                    "claim_id": c["claim_id"],
-                    "text": c["text"],
-                    "anti_queries": c["anti_queries"],
-                    "evidence_neg": hits_neg,
-                    "evidence_text": format_retrieved_context(
-                        hits_neg, max_chars=MAX_CONTEXT_CHARS
-                    ),
-                }
-            )
-        claim_evidence.append(per_claim)
-
-    # ---- Stage 4: Adjudicator ----
-    print("Stage 4 Adjudicator...")
-    adj_jobs = []  # (ex_idx, claim_idx)
-    adj_prompts = []
-    for ex_i, (e, p, claims_ev) in enumerate(
-        zip(examples, policy_outs, claim_evidence)
-    ):
-        for c_i, ce in enumerate(claims_ev):
-            adj_jobs.append((ex_i, c_i))
-            adj_prompts.append(
-                build_adjudicator_prompt(
-                    {"claim_id": ce["claim_id"], "text": ce["text"]},
-                    ce["evidence_text"],
-                    tokenizer,
-                    question=e["question"],
-                    answer=p["y"],
-                )
-            )
-
-    adj_raw = llm.generate(adj_prompts, adjudicator_params) if adj_prompts else []
-    verdicts_by_ex: list[list[dict]] = [[] for _ in examples]
-    for (ex_i, c_i), o in zip(adj_jobs, adj_raw):
-        ce = claim_evidence[ex_i][c_i]
-        verdict = parse_adjudicator_output(
-            o.outputs[0].text, claim_id=ce["claim_id"]
-        )
-        verdicts_by_ex[ex_i].append(verdict)
-
-    # ---- Stage 5+6: Reward + audit ----
-    print("Stage 5–6 Reward + audit...")
+    print("Stages 2–6 Falsifier → E− → Adjudicator → reward...")
     rollouts = []
-    for e, p, claims_ev, verdicts in zip(
-        examples, policy_outs, claim_evidence, verdicts_by_ex
-    ):
-        reward_info = compute_reward(verdicts)
-        claims_audit = []
-        for ce, v in zip(claims_ev, verdicts):
-            claims_audit.append(
-                {
-                    "claim_id": ce["claim_id"],
-                    "text": ce["text"],
-                    "anti_queries": ce["anti_queries"],
-                    "evidence_neg": [
-                        {
-                            "paper_id": h["paper_id"],
-                            "paper_name": h["paper_name"],
-                            "section": h["section"],
-                            "chunk_id": h["chunk_id"],
-                            "score": h["score"],
-                            "anti_query": h.get("anti_query"),
-                            "text": h["text"][:400],
-                        }
-                        for h in ce["evidence_neg"]
-                    ],
-                    "verdict": v["verdict"],
-                    "rationale": v.get("rationale", ""),
-                }
-            )
-
+    for e, o in zip(examples, policy_raw):
+        solution_str = o.outputs[0].text
+        scored = score_policy_response(
+            question=e["question"],
+            paper_name=e["paper_name"],
+            paper_id=e["id"],
+            solution_str=solution_str,
+            retriever=retriever,
+            tokenizer=tokenizer,
+            falsifier_generate=falsifier_generate,
+            adjudicator_generate=adjudicator_generate,
+            top_k_neg=top_k_neg,
+            exclude_source_paper=exclude_source_paper,
+        )
         rollouts.append(
             {
                 "id": e["id"],
@@ -306,16 +154,11 @@ def main(
                     }
                     for h in e["retrieved_pos"]
                 ],
-                "y": p["y"],
-                "claims": claims_audit,
-                "reward": reward_info["reward"],
-                "reward_breakdown": {
-                    "n_claims": reward_info["n_claims"],
-                    "n_refuted": reward_info["n_refuted"],
-                    "n_supported": reward_info["n_supported"],
-                    "n_insufficient": reward_info["n_insufficient"],
-                    "claim_rewards": reward_info["claim_rewards"],
-                },
+                "y": scored.get("y"),
+                "claims": scored.get("claims", []),
+                "parse_ok": scored.get("parse_ok", False),
+                "reward": scored["reward"],
+                "reward_breakdown": scored["reward_breakdown"],
             }
         )
 
@@ -323,14 +166,14 @@ def main(
     print(f"Wrote {len(rollouts)} audited rollouts -> {outputs_path}")
     if rollouts:
         r0 = rollouts[0]
-        print(f"Sample y: {r0['y'][:160]}")
+        print(f"Sample y: {(r0.get('y') or '')[:160]}")
         print(
             f"Sample reward: {r0['reward']:.3f} "
             f"(refuted={r0['reward_breakdown']['n_refuted']}, "
             f"supported={r0['reward_breakdown']['n_supported']}, "
             f"insufficient={r0['reward_breakdown']['n_insufficient']})"
         )
-        for c in r0["claims"]:
+        for c in r0.get("claims") or []:
             print(f"  [{c['claim_id']}] {c['verdict']}: {c['text'][:80]}")
 
 

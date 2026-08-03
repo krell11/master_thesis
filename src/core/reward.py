@@ -8,6 +8,8 @@ VERDICT_SCORE = {
     "insufficient": 0.0,
 }
 
+PARSE_FAIL_PENALTY = -1.0
+
 
 def claim_reward(verdict: str) -> float:
     return float(VERDICT_SCORE.get(verdict, 0.0))

@@ -20,14 +20,13 @@ Use 1–5 claims. claim_id = c0, c1, ...
 """
 
 
-def build_policy_prompt(
+def build_policy_messages(
     question: str,
     context: str,
-    tokenizer: AutoTokenizer,
     paper_name: str | None = None,
-) -> str:
+) -> list[dict]:
     header = f"Target paper (optional hint): {paper_name}\n\n" if paper_name else ""
-    messages = [
+    return [
         {"role": "system", "content": SYSTEM_POLICY_PROMPT.strip()},
         {
             "role": "user",
@@ -38,6 +37,15 @@ def build_policy_prompt(
             ),
         },
     ]
+
+
+def build_policy_prompt(
+    question: str,
+    context: str,
+    tokenizer: AutoTokenizer,
+    paper_name: str | None = None,
+) -> str:
+    messages = build_policy_messages(question, context, paper_name=paper_name)
     prompt = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
